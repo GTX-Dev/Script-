@@ -1,0 +1,522 @@
+# =========================================================
+# STATIS DUAL NEUTROSOFICO PARA COOPERATIVAS DE AHORRO Y CREDITO
+# Script adaptado de la metodologia STATIS Dual Neutrosófico
+# Datos esperados: DATOS.xlsx
+# =========================================================
+# Este script implementa la metodología STATIS Dual Neutrosófica:
+# Fase 1: Preparación de datos neutrosóficos (mismo que STATIS clásico)
+# Fase 2: Inter-estructura Dual (matrices entre variables, no entre individuos)
+# Fase 3: Compromiso Dual Neutrosófico
+# Fase 4: Intra-estructura Dual (ACP del compromiso entre variables)
+# Fase 5: Trayectorias de la estructura de variables en el tiempo
+# =========================================================
+
+# ------------------------------ 0) PAQUETES ------------------------------
+pkgs <- c(
+  "readxl", "dplyr", "tidyr", "stringr", "ggplot2", "ggrepel",
+  "purrr", "tibble", "reshape2"
+)
+new_pkgs <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(new_pkgs) > 0) install.packages(new_pkgs)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+options(stringsAsFactors = FALSE)
+set.seed(123)
+
+# ------------------------------ 1) PARAMETROS GENERALES ------------------------------
+ruta_archivo <- "DATOS.xlsx"
+vars <- c("DEP", "SCC", "INTFIN", "LIQCOR", "MORAMP", "ROA", "ROE")
+years <- 2016:2023
+
+# Pesos para deneutrosificacion (mismos que en STATIS clásico)
+wT <- 0.50
+wI <- 0.30
+wF <- 0.20
+
+# Numero de dimensiones principales del espacio de compromiso dual
+nf <- 3
+
+# ------------------------------ 2) FUNCIONES AUXILIARES ------------------------------
+rescale01 <- function(x) {
+  x <- as.numeric(x)
+  rng <- range(x, na.rm = TRUE)
+  if (any(is.infinite(rng)) || is.na(diff(rng)) || diff(rng) == 0) {
+    return(rep(0.5, length(x)))
+  }
+  (x - rng[1]) / diff(rng)
+}
+
+safe_sd <- function(x) {
+  s <- sd(x, na.rm = TRUE)
+  if (is.na(s) || s == 0) 1 else s
+}
+
+calc_target_truth <- function(x, bench) {
+  dev <- abs(x - bench)
+  max_dev <- max(dev, na.rm = TRUE)
+  if (is.na(max_dev) || max_dev == 0) return(rep(1, length(x)))
+  1 - dev / max_dev
+}
+
+calc_optimal_truth <- function(x, target = 1) {
+  dev <- abs(x - target)
+  max_dev <- max(dev, na.rm = TRUE)
+  if (is.na(max_dev) || max_dev == 0) return(rep(1, length(x)))
+  1 - dev / max_dev
+}
+
+center_scale_matrix <- function(X) {
+  X <- as.matrix(X)
+  Xs <- scale(X, center = TRUE, scale = TRUE)
+  Xs[is.na(Xs)] <- 0
+  Xs
+}
+
+# Coeficiente RV (mismo que en STATIS clásico)
+rv_coeff <- function(S1, S2) {
+  num <- sum(S1 * S2)
+  den <- sqrt(sum(S1 * S1) * sum(S2 * S2))
+  if (is.na(den) || den == 0) return(0)
+  as.numeric(num / den)
+}
+
+# Funcion para construir matriz anual (cooperativas x variables)
+make_year_matrix <- function(df_long, year_value, value_col, coops, vars_ord) {
+  tmp <- df_long %>%
+    filter(year == year_value) %>%
+    select(coop, variable, !!sym(value_col)) %>%
+    tidyr::pivot_wider(names_from = variable, values_from = !!sym(value_col)) %>%
+    arrange(match(coop, coops))
+  
+  X <- as.matrix(tmp[, vars_ord, drop = FALSE])
+  rownames(X) <- tmp$coop
+  colnames(X) <- vars_ord
+  X
+}
+
+# ------------------------------ 3) LECTURA Y REESTRUCTURACION ------------------------------
+col_names <- c("coop", unlist(lapply(years, function(y) paste(vars, y, sep = "_"))))
+raw <- read_excel(ruta_archivo, col_names = FALSE)
+names(raw) <- col_names
+raw <- raw[-1, ]
+raw$coop <- as.character(raw$coop)
+raw[-1] <- lapply(raw[-1], as.numeric)
+
+long <- raw %>%
+  pivot_longer(-coop, names_to = "var_year", values_to = "value") %>%
+  tidyr::extract(var_year, into = c("variable", "year"), regex = "(.*)_(\\d+)", convert = TRUE) %>%
+  arrange(coop, variable, year)
+
+coops <- unique(long$coop)
+
+cat("====================================\n")
+cat("ESTRUCTURA DE DATOS PARA STATIS DUAL NEUTROSOFICO\n")
+cat("====================================\n")
+cat("Numero de cooperativas:", length(coops), "\n")
+cat("Numero de variables:", length(vars), "\n")
+cat("Numero de anios:", length(years), "\n\n")
+
+# ------------------------------ 4) CONSTRUCCION DE T, I, F (igual que STATIS clásico) ------------------------------
+long <- long %>%
+  group_by(variable, year) %>%
+  mutate(
+    norm = rescale01(value),
+    bench_med = median(value, na.rm = TRUE),
+    q25 = quantile(value, 0.25, na.rm = TRUE),
+    q75 = quantile(value, 0.75, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  group_by(coop, variable) %>%
+  arrange(year, .by_group = TRUE) %>%
+  mutate(
+    d_prev = abs(value - lag(value)),
+    d_next = abs(lead(value) - value),
+    vol_local_raw = rowMeans(cbind(ifelse(is.na(d_prev), 0, d_prev),
+                                   ifelse(is.na(d_next), 0, d_next))),
+    vol_local = rescale01(vol_local_raw)
+  ) %>%
+  ungroup() %>%
+  group_by(variable, year) %>%
+  mutate(
+    dev_sector_raw = abs(value - bench_med) / safe_sd(value),
+    dev_sector = rescale01(dev_sector_raw)
+  ) %>%
+  ungroup()
+
+long <- long %>%
+  mutate(
+    T = case_when(
+      variable %in% c("ROA", "ROE") ~ norm,
+      variable == "MORAMP" ~ 1 - norm,
+      variable == "LIQCOR" ~ calc_target_truth(value, bench_med),
+      variable %in% c("DEP", "SCC") ~ pmin(1, pmax(0, (value - q25) / pmax(q75 - q25, 1e-8))),
+      variable == "INTFIN" ~ calc_optimal_truth(value, target = 1.0),
+      TRUE ~ norm
+    ),
+    I = case_when(
+      variable %in% c("ROA", "ROE") ~ pmin(1, 0.70 * vol_local + 0.30 * dev_sector),
+      variable == "MORAMP" ~ pmin(1, 0.60 * vol_local + 0.40 * dev_sector),
+      variable == "LIQCOR" ~ pmin(1, 0.50 * vol_local + 0.50 * dev_sector),
+      variable %in% c("DEP", "SCC") ~ pmin(1, 0.65 * vol_local + 0.35 * dev_sector),
+      variable == "INTFIN" ~ pmin(1, 0.60 * vol_local + 0.40 * dev_sector),
+      TRUE ~ pmin(1, 0.70 * vol_local + 0.30 * dev_sector)
+    )
+  ) %>%
+  mutate(
+    T = pmin(pmax(T, 0), 1),
+    I = pmin(pmax(I, 0), 1),
+    F = pmin(pmax(1 - T, 0), 1),
+    score_neutro = wT * T + wI * (1 - I) + wF * (1 - F)
+  )
+
+# ------------------------------ 5) MATRICES ANUALES PARA STATIS DUAL ------------------------------
+X_years <- lapply(years, function(yy) make_year_matrix(long, yy, "score_neutro", coops, vars))
+names(X_years) <- as.character(years)
+
+# Centrar y escalar cada tabla
+X_years_cs <- lapply(X_years, center_scale_matrix)
+
+# ------------------------------ 6) INTER-ESTRUCTURA DUAL: MATRICES ENTRE VARIABLES ------------------------------
+# DIFERENCIA CLAVE CON STATIS CLASICO: W_k = t(X_k) %*% X_k (variables x variables)
+W_k_dual <- lapply(X_years_cs, function(X) t(X) %*% X)
+names(W_k_dual) <- as.character(years)
+
+# ------------------------------ 7) COEFICIENTE RV DUAL ------------------------------
+# Matriz de similitud entre años basada en la estructura de variables
+K <- length(years)
+RV_dual <- matrix(0, nrow = K, ncol = K, dimnames = list(as.character(years), as.character(years)))
+
+for (i in 1:K) {
+  for (j in 1:K) {
+    RV_dual[i, j] <- rv_coeff(W_k_dual[[i]], W_k_dual[[j]])
+  }
+}
+
+cat("\n====================================\n")
+cat("MATRIZ RV DUAL (Similitud entre estructuras de variables)\n")
+cat("====================================\n")
+print(round(RV_dual, 6))
+
+# ------------------------------ 8) PESOS DUALES (COMPROMISO) ------------------------------
+eig_RV_dual <- eigen(RV_dual)
+weights_dual <- eig_RV_dual$vectors[, 1]
+weights_dual <- as.numeric(weights_dual / sum(weights_dual))
+if (sum(weights_dual < 0) > length(weights_dual) / 2) {
+  weights_dual <- -weights_dual
+  weights_dual <- weights_dual / sum(weights_dual)
+}
+names(weights_dual) <- as.character(years)
+
+cat("\n====================================\n")
+cat("PESOS STATIS DUAL POR ANIO\n")
+cat("====================================\n")
+print(round(data.frame(year = years, weight = weights_dual), 6))
+
+# ------------------------------ 9) MATRIZ DE COMPROMISO DUAL ------------------------------
+# Compromiso: combinación convexa de las matrices de variables
+W_compromise_dual <- Reduce(`+`, Map(function(Wk, a) a * Wk, W_k_dual, weights_dual))
+rownames(W_compromise_dual) <- vars
+colnames(W_compromise_dual) <- vars
+
+cat("\n====================================\n")
+cat("MATRIZ DE COMPROMISO DUAL (Estructura consensuada de variables)\n")
+cat("====================================\n")
+print(round(W_compromise_dual, 6))
+
+# ------------------------------ 10) INTRA-ESTRUCTURA DUAL: ACP DEL COMPROMISO ------------------------------
+eig_comp_dual <- eigen(W_compromise_dual)
+
+# Seleccionar dimensiones con autovalor positivo
+positive_idx_dual <- which(eig_comp_dual$values > 1e-8)
+if (length(positive_idx_dual) < nf) {
+  nf <- length(positive_idx_dual)
+}
+
+lambda_dual <- eig_comp_dual$values[positive_idx_dual][1:nf]
+U_dual <- eig_comp_dual$vectors[, positive_idx_dual, drop = FALSE][, 1:nf, drop = FALSE]
+rownames(U_dual) <- vars
+colnames(U_dual) <- paste0("Dim", 1:nf)
+
+# Coordenadas de las variables en el espacio de compromiso dual
+coord_vars_dual <- as.data.frame(U_dual %*% diag(sqrt(lambda_dual), nrow = length(lambda_dual)))
+colnames(coord_vars_dual) <- paste0("Dim", 1:nf)
+coord_vars_dual$variable <- vars
+coord_vars_dual$inercia_contrib <- rowSums(coord_vars_dual[, paste0("Dim", 1:nf), drop = FALSE]^2)
+
+# Porcentajes de inercia explicada
+inercia_pct_dual <- 100 * lambda_dual / sum(eig_comp_dual$values[eig_comp_dual$values > 0])
+
+cat("\n====================================\n")
+cat("INERCIA DEL ESPACIO DE COMPROMISO DUAL\n")
+cat("====================================\n")
+print(data.frame(
+  dimension = paste0("Dim", 1:nf),
+  eigenvalue = round(lambda_dual, 6),
+  inertia_pct = round(inercia_pct_dual, 6)
+))
+
+# ------------------------------ 11) PROYECCION DE AÑOS INDIVIDUALES (TRAYECTORIAS DE LA ESTRUCTURA) ------------------------------
+# Proyectar cada matriz W_k en el espacio de compromiso
+partial_dual_coords <- lapply(seq_along(years), function(i) {
+  # F_k = W_k * U * Lambda^{-1/2}
+  inv_sqrt_lambda <- diag(1 / sqrt(lambda_dual), nrow = length(lambda_dual))
+  Fk <- W_k_dual[[i]] %*% U_dual %*% inv_sqrt_lambda
+  out <- as.data.frame(Fk)
+  colnames(out) <- paste0("Dim", 1:nf)
+  out$variable <- vars
+  out$year <- years[i]
+  out$weight <- weights_dual[i]
+  out
+})
+
+partial_dual_df <- bind_rows(partial_dual_coords)
+
+# ------------------------------ 12) COORDENADAS DE COOPERATIVAS COMO SUPLEMENTARIAS ------------------------------
+# Proyectar las cooperativas en el espacio de compromiso dual (elementos suplementarios)
+# Para cada año, calcular coordenadas de cooperativas: G_k = X_k * U * Lambda^{-1/2}
+coops_sup_list <- lapply(seq_along(years), function(i) {
+  inv_sqrt_lambda <- diag(1 / sqrt(lambda_dual), nrow = length(lambda_dual))
+  Gk <- X_years_cs[[i]] %*% U_dual %*% inv_sqrt_lambda
+  out <- as.data.frame(Gk)
+  colnames(out) <- paste0("Dim", 1:nf)
+  out$coop <- coops
+  out$year <- years[i]
+  out
+})
+
+coops_sup_df <- bind_rows(coops_sup_list)
+
+# Coordenadas promedio de cooperativas en el compromiso dual (consenso)
+coops_consensus <- coops_sup_df %>%
+  group_by(coop) %>%
+  summarise(
+    Dim1 = mean(Dim1, na.rm = TRUE),
+    Dim2 = mean(Dim2, na.rm = TRUE),
+    Dim3 = mean(Dim3, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ------------------------------ 13) CLUSTER DE VARIABLES ------------------------------
+set.seed(123)
+k_clusters_vars <- 3  # Número de clusters para variables
+km_vars <- kmeans(coord_vars_dual[, paste0("Dim", 1:min(2, nf))], centers = k_clusters_vars, nstart = 25)
+coord_vars_dual$cluster <- paste0("Cluster_", km_vars$cluster)
+
+# ------------------------------ 14) EXPORTAR TABLAS ------------------------------
+write.csv(long, "datos_neutrosoficos_statis_dual_long.csv", row.names = FALSE)
+write.csv(data.frame(year = years, weight = weights_dual), "pesos_statis_dual_neutrosofico.csv", row.names = FALSE)
+write.csv(as.data.frame(RV_dual) %>% mutate(year = rownames(RV_dual)) %>% relocate(year), "matriz_rv_dual_neutrosofica.csv", row.names = FALSE)
+write.csv(coord_vars_dual, "coordenadas_variables_compromiso_dual.csv", row.names = FALSE)
+write.csv(partial_dual_df, "trayectorias_estructura_variables_dual.csv", row.names = FALSE)
+write.csv(coops_consensus, "coordenadas_cooperativas_compromiso_dual.csv", row.names = FALSE)
+write.csv(data.frame(dimension = paste0("Dim", 1:nf), eigenvalue = lambda_dual, inertia_pct = inercia_pct_dual),
+          "inercia_compromiso_dual.csv", row.names = FALSE)
+
+# ------------------------------ 15) GRAFICOS ------------------------------
+
+# 15.1 Heatmap de similitud RV Dual
+RV_dual_df <- as.data.frame(as.table(RV_dual))
+colnames(RV_dual_df) <- c("year1", "year2", "RV")
+
+p_rv_dual <- ggplot(RV_dual_df, aes(x = year1, y = year2, fill = RV)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.3f", RV)), size = 3) +
+  scale_fill_gradient2(low = "white", mid = "yellow", high = "red", midpoint = 0.4) +
+  labs(title = "Matriz de similitud RV Dual Neutrosófico",
+       subtitle = "Similitud entre estructuras de relaciones de variables financieras",
+       x = "Año", y = "Año", fill = "RV") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave("heatmap_rv_dual_neutrosofico.png", p_rv_dual, width = 8, height = 7, dpi = 300)
+
+# 15.2 Mapa de compromiso dual (círculo de correlaciones de variables)
+p_vars_dual <- ggplot(coord_vars_dual, aes(x = Dim1, y = Dim2, color = cluster)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  # Círculo de correlación unitario
+  annotate("path",
+           x = cos(seq(0, 2 * pi, length.out = 100)),
+           y = sin(seq(0, 2 * pi, length.out = 100)),
+           color = "grey50", linetype = "dotted") +
+  geom_segment(aes(x = 0, y = 0, xend = Dim1, yend = Dim2),
+               arrow = arrow(length = unit(0.2, "cm")), linewidth = 0.8, color = "darkblue") +
+  geom_point(size = 4, aes(color = cluster)) +
+  ggrepel::geom_text_repel(aes(label = variable), size = 5, fontface = "bold", max.overlaps = 100) +
+  labs(title = "Mapa de Compromiso Dual Neutrosófico",
+       subtitle = sprintf("Estructura consensuada de relaciones entre variables financieras\nInercia Dim1 = %.2f%%, Dim2 = %.2f%%", 
+                          inercia_pct_dual[1], ifelse(length(inercia_pct_dual) >= 2, inercia_pct_dual[2], NA)),
+       x = paste0("Dimensión 1 (", round(inercia_pct_dual[1], 2), "%)"),
+       y = paste0("Dimensión 2 (", round(inercia_pct_dual[2], 2), "%)")) +
+  coord_fixed(ratio = 1) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave("mapa_compromiso_dual_variables.png", p_vars_dual, width = 10, height = 8, dpi = 300)
+
+# 15.3 Trayectorias de la estructura de variables (evolución temporal)
+p_traj_estructura <- ggplot(partial_dual_df, aes(x = Dim1, y = Dim2, group = variable, color = variable)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_path(linewidth = 0.8, alpha = 0.7) +
+  geom_point(aes(shape = factor(year)), size = 2.5) +
+  ggrepel::geom_text_repel(data = partial_dual_df %>% filter(year == max(year)),
+                           aes(label = variable), size = 4, fontface = "bold", max.overlaps = 100) +
+  labs(title = "Trayectorias de la Estructura de Variables Financieras (2016-2023)",
+       subtitle = "Evolución de la posición de cada variable en el espacio de compromiso dual",
+       x = paste0("Dimensión 1 (", round(inercia_pct_dual[1], 2), "%)"),
+       y = paste0("Dimensión 2 (", round(inercia_pct_dual[2], 2), "%)"),
+       shape = "Año") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave("trayectorias_estructura_variables_dual.png", p_traj_estructura, width = 11, height = 8, dpi = 300)
+
+# 15.4 Biplot dual: variables + cooperativas (suplementarias)
+# Tomar solo las cooperativas más representativas para no saturar el gráfico
+coops_contrib <- coops_consensus %>%
+  mutate(contrib = sqrt(Dim1^2 + Dim2^2)) %>%
+  arrange(desc(contrib)) %>%
+  slice(1:12)
+
+p_biplot_dual <- ggplot() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  # Variables activas (vectores)
+  geom_segment(data = coord_vars_dual, aes(x = 0, y = 0, xend = Dim1, yend = Dim2),
+               arrow = arrow(length = unit(0.2, "cm")), linewidth = 0.9, color = "darkred") +
+  geom_point(data = coord_vars_dual, aes(x = Dim1, y = Dim2), size = 4, color = "darkred", shape = 17) +
+  ggrepel::geom_text_repel(data = coord_vars_dual, aes(x = Dim1, y = Dim2, label = variable),
+                           size = 5, fontface = "bold", color = "darkred", max.overlaps = 100) +
+  # Cooperativas suplementarias
+  geom_point(data = coops_contrib, aes(x = Dim1, y = Dim2), size = 2.5, alpha = 0.7, color = "steelblue") +
+  ggrepel::geom_text_repel(data = coops_contrib, aes(x = Dim1, y = Dim2, label = coop),
+                           size = 3, color = "steelblue", max.overlaps = 100) +
+  labs(title = "Biplot Dual Neutrosófico",
+       subtitle = "Variables activas (vectores rojos) y cooperativas suplementarias (puntos azules)",
+       x = paste0("Dimensión 1 (", round(inercia_pct_dual[1], 2), "%)"),
+       y = paste0("Dimensión 2 (", round(inercia_pct_dual[2], 2), "%)")) +
+  coord_fixed(ratio = 1) +
+  theme_minimal()
+
+ggsave("biplot_dual_variables_cooperativas.png", p_biplot_dual, width = 11, height = 8, dpi = 300)
+
+# 15.5 Contribución de variables por dimensión
+contrib_vars <- coord_vars_dual %>%
+  mutate(
+    contrib_dim1 = abs(Dim1) / sum(abs(Dim1)) * 100,
+    contrib_dim2 = abs(Dim2) / sum(abs(Dim2)) * 100
+  ) %>%
+  select(variable, contrib_dim1, contrib_dim2, cluster) %>%
+  arrange(desc(contrib_dim1))
+
+p_contrib <- ggplot(contrib_vars, aes(x = reorder(variable, contrib_dim1), y = contrib_dim1, fill = cluster)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Contribución de Variables a la Dimensión 1 del Compromiso Dual",
+       x = "Variable", y = "Contribución (%)") +
+  theme_minimal()
+
+ggsave("contribucion_variables_dim1_dual.png", p_contrib, width = 8, height = 6, dpi = 300)
+
+# 15.6 Evolución de la correlación entre variables clave en el tiempo
+# Extraer elementos de W_k_dual (correlaciones entre variables por año)
+cor_evolution <- lapply(seq_along(years), function(i) {
+  W <- W_k_dual[[i]]
+  # Normalizar a matriz de correlación
+  d <- sqrt(diag(W))
+  cor_matrix <- W / outer(d, d)
+  data.frame(
+    year = years[i],
+    var1 = rep(rownames(cor_matrix), each = ncol(cor_matrix)),
+    var2 = rep(colnames(cor_matrix), times = nrow(cor_matrix)),
+    cor = as.vector(cor_matrix)
+  )
+}) %>% bind_rows()
+
+# Filtrar pares relevantes (ej: ROA-ROE, ROA-MORAMP, DEP-SCC, INTFIN-ROA)
+pairs_of_interest <- c("ROA_ROE", "ROA_MORAMP", "DEP_SCC", "INTFIN_ROA", "INTFIN_ROE")
+cor_evolution_filtered <- cor_evolution %>%
+  filter(paste(var1, var2, sep = "_") %in% pairs_of_interest | 
+           paste(var2, var1, sep = "_") %in% pairs_of_interest) %>%
+  mutate(pair = case_when(
+    (var1 == "ROA" & var2 == "ROE") | (var1 == "ROE" & var2 == "ROA") ~ "ROA-ROE",
+    (var1 == "ROA" & var2 == "MORAMP") | (var1 == "MORAMP" & var2 == "ROA") ~ "ROA-MORAMP",
+    (var1 == "DEP" & var2 == "SCC") | (var1 == "SCC" & var2 == "DEP") ~ "DEP-SCC",
+    (var1 == "INTFIN" & var2 == "ROA") | (var1 == "ROA" & var2 == "INTFIN") ~ "INTFIN-ROA",
+    (var1 == "INTFIN" & var2 == "ROE") | (var1 == "ROE" & var2 == "INTFIN") ~ "INTFIN-ROE",
+    TRUE ~ paste(var1, var2, sep = "-")
+  )) %>%
+  distinct(year, pair, .keep_all = TRUE)
+
+p_cor_evol <- ggplot(cor_evolution_filtered, aes(x = year, y = cor, color = pair, group = pair)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(title = "Evolución de Correlaciones entre Variables Financieras Clave",
+       subtitle = "Cambios en la estructura de relaciones a lo largo del período 2016-2023",
+       x = "Año", y = "Correlación", color = "Par de variables") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave("evolucion_correlaciones_dual.png", p_cor_evol, width = 10, height = 7, dpi = 300)
+
+# ------------------------------ 16) RESUMEN EN CONSOLA ------------------------------
+cat("\n====================================\n")
+cat("RESUMEN DEL ANALISIS STATIS DUAL NEUTROSOFICO\n")
+cat("====================================\n")
+
+cat("\n--- INTERPRETACION DEL ESPACIO DE COMPROMISO DUAL ---\n")
+cat("Dimensión 1 (", round(inercia_pct_dual[1], 2), "%): ")
+if (any(coord_vars_dual$Dim1 > 0)) {
+  pos_vars <- coord_vars_dual %>% filter(Dim1 > 0) %>% pull(variable) %>% paste(collapse = ", ")
+  neg_vars <- coord_vars_dual %>% filter(Dim1 < 0) %>% pull(variable) %>% paste(collapse = ", ")
+  cat("Separa (+)", pos_vars, "de (-)", neg_vars, "\n")
+}
+
+cat("Dimensión 2 (", round(inercia_pct_dual[2], 2), "%): ")
+if (any(coord_vars_dual$Dim2 > 0)) {
+  pos_vars <- coord_vars_dual %>% filter(Dim2 > 0) %>% pull(variable) %>% paste(collapse = ", ")
+  neg_vars <- coord_vars_dual %>% filter(Dim2 < 0) %>% pull(variable) %>% paste(collapse = ", ")
+  cat("Separa (+)", pos_vars, "de (-)", neg_vars, "\n")
+}
+
+cat("\n--- TOP VARIABLES POR CONTRIBUCION AL PLANO DUAL ---\n")
+print(coord_vars_dual %>% 
+        arrange(desc(inercia_contrib)) %>% 
+        select(variable, Dim1, Dim2, inercia_contrib, cluster) %>% 
+        head(5))
+
+cat("\n--- AÑOS CON MAYOR PESO EN EL COMPROMISO DUAL ---\n")
+print(data.frame(year = years, weight = weights_dual) %>% arrange(desc(weight)) %>% head(3))
+
+cat("\n--- AÑOS CON MENOR PESO EN EL COMPROMISO DUAL ---\n")
+print(data.frame(year = years, weight = weights_dual) %>% arrange(weight) %>% head(3))
+
+cat("\n====================================\n")
+cat("Proceso STATIS Dual Neutrosófico finalizado correctamente.\n")
+cat("Archivos generados:\n")
+cat("  - coordenadas_variables_compromiso_dual.csv\n")
+cat("  - trayectorias_estructura_variables_dual.csv\n")
+cat("  - coordenadas_cooperativas_compromiso_dual.csv\n")
+cat("  - matriz_rv_dual_neutrosofica.csv\n")
+cat("  - pesos_statis_dual_neutrosofico.csv\n")
+cat("  - evolucion_correlaciones_dual.png\n")
+cat("====================================\n")
+
+# Generar heatmap de incertidumbre para el análisis dual
+# (utilizando los mismos datos long del STATIS dual)
+
+I_heat_dual <- long %>%
+  group_by(coop, variable) %>%
+  summarise(I_mean = mean(I, na.rm = TRUE), .groups = "drop")
+
+p_I_dual <- ggplot(I_heat_dual, aes(x = variable, y = coop, fill = I_mean)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "darkred") +
+  labs(title = "Mapa de incertidumbre promedio por cooperativa y variable\n(Modelo STATIS Dual Neutrosófico)",
+       x = "Variable", y = "Cooperativa", fill = "I promedio") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 6))
+
+ggsave("mapa_incertidumbre_dual_neutrosofico.png", p_I_dual, width = 10, height = 12, dpi = 300)
